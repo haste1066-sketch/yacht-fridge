@@ -1,0 +1,55 @@
+# Pin map & behaviour toggles (edit to match your wiring)
+
+espnow:
+  channel: 6
+  sender_peer_mac: "24:0A:C4:AA:BB:CC"      # controller MAC
+  controller_peer_mac: "24:0A:C4:DD:EE:FF"  # sender MAC
+
+lcd:
+  i2c_addr: 0x27      # common addresses: 0x27 or 0x3F
+  cols: 20
+  rows: 4
+  sda: 21
+  scl: 22
+
+sensors:
+  # OneWire or DS18B20 pins if used; else analog NTC pins
+  t_box_pin: 34       # analog NTC
+  t_hot_pin: 35       # analog NTC on hot-side HX
+  t_amb_pin: 32       # analog NTC ambient (optional)
+  t_coolant_pin: 33   # optional
+
+control_thresholds:
+  setpoint_c: 3.0           # target °C for box
+  on_delta_c: 1.0           # turns ON if T_box > setpoint + on_delta
+  off_delta_c: 0.5          # turns OFF if T_box < setpoint - off_delta
+  min_on_ms: 60000          # anti-short-cycle
+  min_off_ms: 60000
+  defrost_idle_duty: 20     # % idle fan duty when TECs OFF
+  postrun_pump_ms: 20000    # keep pumps running after TECs OFF
+  hot_side_max_c: 65.0      # safety cut
+  packet_timeout_ms: 4000   # fail-safe if no packet
+
+features:
+  seawater_pump_present: false
+  use_pwm_fans: true
+  pwm_frequency: 25000
+  pwm_resolution_bits: 8
+
+controller_pins:
+  tec_enable: 25            # relay/MOSFET gate
+  fan_hot_pwm: 26
+  fan_box_pwm: 27
+  pump1_enable: 14
+  pump2_enable: 12
+  vbat_adc: 36
+
+adc:
+  r_top: 100000.0           # for voltage divider calc
+  r_bottom: 10000.0
+
+calibration:
+  ntc_beta: 3950
+  ntc_r0: 10000
+  ntc_t0_c: 25
+  series_res_ohm: 10000
