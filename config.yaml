@@ -14,10 +14,10 @@ lcd:
 
 sensors:
   # OneWire or DS18B20 pins if used; else analog NTC pins
-  t_box_pin: 34       # analog NTC
-  t_hot_pin: 35       # analog NTC on hot-side HX
-  t_amb_pin: 32       # analog NTC ambient (optional)
-  t_coolant_pin: 33   # optional
+  t_box_pin: 13       # DS18B20 OneWire data pin
+  t_hot_pin: 13       # DS18B20 on same OneWire bus
+  t_amb_pin: 13       # optional
+  t_coolant_pin: 13   # optional
 
 control_thresholds:
   setpoint_c: 3.0           # target °C for box
