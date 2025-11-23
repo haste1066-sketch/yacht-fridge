@@ -3,11 +3,18 @@
 #include <LiquidCrystal_I2C.h>
 #include <esp_now.h>
 #include <WiFi.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
 // ------- CONFIG SNIPPET (inline for demo; mirror values from config.yaml) -------
 static const uint8_t CONTROLLER_MAC[6] = {0x24,0x0A,0xC4,0xAA,0xBB,0xCC};
-const int LCD_ADDR=0x27, LCD_COLS=20, LCD_ROWS=4, I2C_SDA=21, I2C_SCL=22;
-const int PIN_T_BOX=34, PIN_T_HOT=35, PIN_T_AMB=32, PIN_T_COOL=33;
+const int LCD_ADDR=0x27, LCD_COLS=20, LCD_ROWS=4, I2C_SDA=21, I2C_SCL=22; // All DS18B20 sensors share the same OneWire bus on GPIO 13
+#define ONE_WIRE_BUS 13
+// ROM strings (16 hex chars each) for the three DS18B20 sensors
+const char *ROM_FRIDGE = "280088780000005F";   // fridge temp
+const char *ROM_COLD   = "28BC237800000066";   // cold-side coolant temp (Peltier cold)
+const char *ROM_HOT    = "28A9AF780000003C";  // hot-side coolant temp (Peltier hot)
+
 const float SETPOINT=3.0, ON_DELTA=1.0, OFF_DELTA=0.5;
 const uint32_t MIN_ON_MS=60000, MIN_OFF_MS=60000;
 const int ESPNOW_CH=6;
@@ -40,40 +47,88 @@ uint16_t crc16(const uint8_t* d, size_t n){
   return c;
 }
 
-// Simple NTC conversion (edit to match sensors)
-float analogToCelsius(int pin){
-  int raw = analogRead(pin);
-  if(raw<=0) return NAN;
-  const float Vref=3.3, ADCmax=4095.0;
-  float v = (raw/ADCmax)*Vref;
-  const float Rseries=10000.0, Beta=3950.0, R0=10000.0, T0=298.15;
-  float R = (v>0.0001)? (Rseries * (Vref/v - 1.0)) : 1e9;
-  float invT = 1.0/T0 + (1.0/Beta)*log(R/R0);
-  return (1.0/invT) - 273.15;
+// OneWire / DallasTemperature setup
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature ds18b20(&oneWire);
+
+typedef uint8_t DeviceAddress8[8];
+DeviceAddress8 addr_fridge;
+DeviceAddress8 addr_cold;
+DeviceAddress8 addr_hot;
+
+// parse a 16-char hex string (like "28A9AF780000003C") into 8-byte device address
+bool parseRomString(const char *hexStr, DeviceAddress8 addr) {
+  if (!hexStr) return false;
+  size_t len = strlen(hexStr);
+  if (len != 16) return false;
+  char byteStr[3] = {0,0,0};
+  for (int i = 0; i < 8; ++i) {
+    byteStr[0] = hexStr[i*2];
+    byteStr[1] = hexStr[i*2 + 1];
+    // strtol handles upper/lowercase hex
+    addr[i] = (uint8_t)strtol(byteStr, nullptr, 16);
+  }
+  return true;
 }
 
-bool fridgeOn=false;
-uint32_t lastToggle=0;
-uint32_t seq=0;
+void printAddress(const DeviceAddress8 addr) {
+  for (uint8_t i = 0; i < 8; i++) {
+    if (addr[i] < 16) Serial.print('0');
+    Serial.print(addr[i], HEX);
+  }
+}
 
 void onDataSent(const uint8_t*, esp_now_send_status_t status){
   // status only shows TX result; ACK comes via onDataRecv
 }
 
 void onDataRecv(const uint8_t* mac, const uint8_t* data, int len){
-  if(len==(int)sizeof(RxAck)){
+  if(len==(int)sizeof(RxAck)){ 
     memcpy(&lastAck, data, len);
     gotAck=true;
     lastAckMs = millis();
   }
 }
 
+bool deviceAddressIsValid(const DeviceAddress8 addr) {
+  // simple check: not all 0x00 or all 0xFF
+  bool allZero=true, allFF=true;
+  for(int i=0;i<8;i++){
+    if(addr[i]!=0x00) allZero=false;
+    if(addr[i]!=0xFF) allFF=false;
+  }
+  return !(allZero || allFF);
+}
+
 void setup(){
   Serial.begin(115200);
-  analogReadResolution(12);
+  delay(100);
   Wire.begin(I2C_SDA, I2C_SCL);
   lcd.init(); lcd.backlight();
   lcd.clear(); lcd.setCursor(0,0); lcd.print("Yacht Fridge: SENDER");
+
+  // parse ROMs
+  if(!parseRomString(ROM_FRIDGE, addr_fridge)) Serial.println("Failed to parse fridge ROM");
+  if(!parseRomString(ROM_COLD, addr_cold))   Serial.println("Failed to parse cold ROM");
+  if(!parseRomString(ROM_HOT, addr_hot))     Serial.println("Failed to parse hot ROM");
+
+  Serial.print("OneWire bus pin: ");
+  Serial.println(ONE_WIRE_BUS);
+  Serial.print("Fridge ROM: ");
+  printAddress(addr_fridge); Serial.println();
+  Serial.print("Cold ROM: ");
+  printAddress(addr_cold); Serial.println();
+  Serial.print("Hot ROM: ");
+  printAddress(addr_hot); Serial.println();
+
+  ds18b20.begin();
+  // Optionally set resolution per-device
+  if(deviceAddressIsValid(addr_fridge)) ds18b20.setResolution((uint8_t*)addr_fridge, 12);
+  if(deviceAddressIsValid(addr_cold))   ds18b20.setResolution((uint8_t*)addr_cold, 12);
+  if(deviceAddressIsValid(addr_hot))    ds18b20.setResolution((uint8_t*)addr_hot, 12);
+
+  Serial.print("Devices found on bus: ");
+  Serial.println(ds18b20.getDeviceCount());
 
   WiFi.mode(WIFI_STA);
   esp_wifi_set_channel(ESPNOW_CH, WIFI_SECOND_CHAN_NONE);
@@ -85,42 +140,63 @@ void setup(){
   esp_now_add_peer(&peer);
 }
 
-void loop(){
-  // Read sensors
-  float tBox=analogToCelsius(PIN_T_BOX);
-  float tHot=analogToCelsius(PIN_T_HOT);
-  float tAmb=analogToCelsius(PIN_T_AMB);
-  float tCool=analogToCelsius(PIN_T_COOL); // may be NAN if unused
+bool fridgeOn=false;
+uint32_t lastToggle=0;
+uint32_t seq=0;
 
-  bool sensorsOK = isfinite(tBox) && isfinite(tHot);
+inline int16_t s10_from_float(float c){
+  return isfinite(c)? (int16_t)round(c*10.0) : (int16_t)-32768;
+}
+
+void loop(){
+  // request temps from all devices on the bus
+  ds18b20.requestTemperatures();
+
+  float tBox = DEVICE_DISCONNECTED_C;
+  float tCold = DEVICE_DISCONNECTED_C;
+  float tHot = DEVICE_DISCONNECTED_C;
+  float tAmb = DEVICE_DISCONNECTED_C; // optional/unused if no ambient probe
+
+  if(deviceAddressIsValid(addr_fridge)) tBox = ds18b20.getTempC((uint8_t*)addr_fridge);
+  if(deviceAddressIsValid(addr_cold))   tCold = ds18b20.getTempC((uint8_t*)addr_cold);
+  if(deviceAddressIsValid(addr_hot))    tHot = ds18b20.getTempC((uint8_t*)addr_hot);
+
+  bool sensorsOK = (tBox != DEVICE_DISCONNECTED_C) && (tHot != DEVICE_DISCONNECTED_C);
   bool alarmHot  = sensorsOK && (tHot > 65.0);
   bool alarmProbe= !sensorsOK;
 
   // Hysteresis & anti short-cycle
   uint32_t now=millis();
   if(!fridgeOn){
-    if(tBox > (SETPOINT+ON_DELTA) && (now-lastToggle)>=MIN_OFF_MS) { fridgeOn=true; lastToggle=now; }
+    if(isfinite(tBox) && tBox > (SETPOINT+ON_DELTA) && (now-lastToggle)>=MIN_OFF_MS) { fridgeOn=true; lastToggle=now; }
   } else {
-    if(tBox < (SETPOINT-OFF_DELTA) && (now-lastToggle)>=MIN_ON_MS) { fridgeOn=false; lastToggle=now; }
+    if(isfinite(tBox) && tBox < (SETPOINT-OFF_DELTA) && (now-lastToggle)>=MIN_ON_MS) { fridgeOn=false; lastToggle=now; }
   }
 
   // Build & send packet
   TxPacket p{};
   p.seq = ++seq;
   p.millis32 = now;
-  auto s10 = [](float c)->int16_t{ return isfinite(c)? (int16_t)round(c*10.0): (int16_t)-32768; };
-  p.t_box = s10(tBox); p.t_hot = s10(tHot); p.t_amb = s10(tAmb); p.t_cool = s10(tCool);
+  p.t_box  = s10_from_float((tBox==DEVICE_DISCONNECTED_C)? NAN : tBox);
+  p.t_hot  = s10_from_float((tHot==DEVICE_DISCONNECTED_C)? NAN : tHot);
+  p.t_amb  = s10_from_float((tAmb==DEVICE_DISCONNECTED_C)? NAN : tAmb);
+  p.t_cool = s10_from_float((tCold==DEVICE_DISCONNECTED_C)? NAN : tCold);
   p.fridge_on = fridgeOn?1:0;
   p.flags = (sensorsOK?1:0) | (alarmHot? (1<<1):0) | (alarmProbe? (1<<2):0);
   p.crc16 = crc16((uint8_t*)&p, sizeof(p)-2);
 
   esp_now_send(CONTROLLER_MAC, (uint8_t*)&p, sizeof(p));
 
-  // LCD
+  // LCD display (format similar to previous)
   lcd.setCursor(0,1);
-  lcd.printf("Box:%5.1fC Hot:%5.1fC  ", tBox, tHot);
+  // avoid printing "nan" to LCD: show --.- if disconnected
+  auto disp = [](float v)->String{
+    if(v==DEVICE_DISCONNECTED_C || !isfinite(v)) return "--.-";
+    char buf[8]; sprintf(buf, "%5.1f", v); return String(buf);
+  };
+  lcd.printf("Box:%sC Hot:%sC  ", disp(tBox).c_str(), disp(tHot).c_str());
   lcd.setCursor(0,2);
-  lcd.printf("Amb:%5.1fC  Fridge:%s   ", tAmb, fridgeOn?"ON ":"OFF");
+  lcd.printf("Cold:%sC  Fridge:%s   ", disp(tCold).c_str(), fridgeOn?"ON ":"OFF");
   lcd.setCursor(0,3);
   uint32_t age = gotAck? (now-lastAckMs):99999;
   lcd.printf("ACK:%s Age:%4lus       ", gotAck?"OK ":"-- ", (unsigned long)(age/1000));
